@@ -4,6 +4,7 @@ import os
 from utils.cnn_model import train_and_save_model
 from utils.database import insert_usuario, delete_usuario, get_all_usuarios
 from werkzeug.utils import secure_filename
+from utils.recognition import recognize_user
 
 app = Flask(__name__)
 CORS(app)
@@ -34,7 +35,12 @@ def registrar_usuario():
         return jsonify({'error': 'Se requieren al menos 5 imágenes'}), 400
 
     user_folder = os.path.join(app.config['UPLOAD_FOLDER'], codigo_unico)
-    class_folder = os.path.join(user_folder, 'rostro')  # subfolder for class
+    os.makedirs(user_folder, exist_ok=True)
+
+    if codigo_unico == 'no_rostro':
+        class_folder = os.path.join(user_folder, 'rostro')
+    else:
+        class_folder = os.path.join(user_folder, 'rostro')
     os.makedirs(class_folder, exist_ok=True)
 
     for idx, file in enumerate(files):
@@ -72,15 +78,10 @@ def eliminar_usuario():
     else:
         return jsonify({'error': 'Usuario no encontrado o no se pudo eliminar'}), 404
 
-# Endpoint para listar todos los usuarios registrados
 @app.route('/listar_usuarios', methods=['GET'])
 def listar_usuarios():
     usuarios = get_all_usuarios()
     return jsonify(usuarios)
-
-import cv2
-import numpy as np
-from tensorflow.keras.models import load_model
 
 @app.route('/reconocer_usuario', methods=['POST'])
 def reconocer_usuario():
@@ -93,33 +94,23 @@ def reconocer_usuario():
         temp_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(temp_path)
 
-        # Preprocesar la imagen
-        img = cv2.imread(temp_path)
-        img = cv2.resize(img, (128, 128))
-        img = img.astype('float32') / 255.0
-        img = np.expand_dims(img, axis=0)
-
         usuarios = get_all_usuarios()
-        for usuario in usuarios:
-            model_path = usuario['ruta_modelo']
-            if os.path.exists(model_path):
-                model = load_model(model_path)
-                prediction = model.predict(img)
-                confidence = prediction[0][0]  # Probabilidad para la única clase entrenada
-
-                # Aplicar un umbral más estricto y comprobación para reducir falsos positivos
-                if 0.8 < confidence <= 1.0:  
-                    os.remove(temp_path)
-                    return jsonify({
-                        'message': 'Usuario reconocido',
-                        'codigo_unico': usuario['codigo_unico'],
-                        'nombre': usuario['nombre'],
-                        'apellido': usuario['apellido'],
-                        'requisitoriado': usuario['requisitoriado']
-                    })
+        resultado = recognize_user(temp_path, usuarios)
 
         os.remove(temp_path)
-        return jsonify({'message': 'Usuario no reconocido'})
+
+        if resultado:
+            return jsonify({
+                'message': 'Usuario reconocido' if resultado['clase_detectada'] == 'rostro' else 'No corresponde al rostro registrado',
+                'codigo_unico': resultado['codigo_unico'],
+                'nombre': resultado['nombre'],
+                'apellido': resultado['apellido'],
+                'requisitoriado': resultado['requisitoriado'],
+                'confidence': resultado['confidence'],
+                'clase_detectada': resultado['clase_detectada']
+            })
+        else:
+            return jsonify({'message': 'Usuario no reconocido'})
     else:
         return jsonify({'error': 'Formato de imagen no permitido'}), 400
 
