@@ -91,7 +91,9 @@ def reconocer_usuario():
     file = request.files['imagen']
     if file and allowed_file(file.filename):
         filename = secure_filename(file.filename)
-        temp_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        upload_folder = os.path.join(os.getcwd(), app.config['UPLOAD_FOLDER'])
+        os.makedirs(upload_folder, exist_ok=True)
+        temp_path = os.path.join(upload_folder, filename)
         file.save(temp_path)
 
         usuarios = get_all_usuarios()
