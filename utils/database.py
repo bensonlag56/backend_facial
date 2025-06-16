@@ -22,7 +22,7 @@ def insert_usuario(nombre, apellido, codigo_unico, email, requisitoriado, ruta_m
     try:
         cursor = connection.cursor()
         sql = """
-        INSERT INTO usuarios (nombre, apellido, codigo_unico, email, requisitoriado, ruta_modelo)
+        INSERT INTO usuarios (nombre, apellido, codigo_unico, email, requisitoriado, modelo_path)
         VALUES (%s, %s, %s, %s, %s, %s)
         """
         values = (nombre, apellido, codigo_unico, email, requisitoriado, ruta_modelo)
