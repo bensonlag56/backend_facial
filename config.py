@@ -1,8 +1,10 @@
-# Configuración de la base de datos MySQL
-DB_HOST = 'localhost'
-DB_USER = 'root'
-DB_PASSWORD = '949212489'
-DB_NAME = 'seguridad_facial'
+import os
+
+DB_HOST = os.getenv('mysql.railway.internal')
+DB_USER = os.getenv('root')
+DB_PASSWORD = os.getenv('JqsHAilfOvOfsxBJSzyKjQnWOTshsNAz')
+DB_NAME = os.getenv('railway')
+DB_PORT = int(os.getenv('3306', 3306))
 
 # Rutas de carpetas
 UPLOAD_FOLDER = 'imagenes'
