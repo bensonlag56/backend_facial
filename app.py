@@ -169,28 +169,42 @@ def compare_features(query_features, stored_features):
 def register_user():
     try:
         data = request.json
-        required_fields = ['nombre', 'apellido', 'codigo_unico', 'email', 'requisitoriado', 'imagen_facial']
+        required_fields = ['nombre', 'apellido', 'codigo_unico', 'email', 'requisitoriado', 'imagen_frontal', 'imagen_izquierda', 'imagen_derecha']
         if not all(field in data for field in required_fields):
             return jsonify({'error': 'Faltan campos requeridos'}), 400
         
-        # Validar imagen
+        # Validar imágenes
         try:
-            img_array = image_to_array(data['imagen_facial'])
+            img_front = image_to_array(data['imagen_frontal'])
+            img_left = image_to_array(data['imagen_izquierda'])
+            img_right = image_to_array(data['imagen_derecha'])
         except:
-            return jsonify({'error': 'Imagen inválida'}), 400
-        
-        # Aplicar aumento de datos
-        augmented_images = augment_image(img_array)
+            return jsonify({'error': 'Una o más imágenes son inválidas'}), 400
 
-        # Extraer características de todas las imágenes aumentadas
-        features_list = [extract_features(img) for img in augmented_images]
+        # Extraer características de cada imagen
+        features_front = extract_features(img_front)
+        features_left = extract_features(img_left)
+        features_right = extract_features(img_right)
 
         # Promediar características
-        avg_hog = np.mean([np.frombuffer(f['hog'], dtype=np.float64) for f in features_list], axis=0)
-        avg_lbp = np.mean([np.frombuffer(f['lbp'], dtype=np.float32) for f in features_list], axis=0)
-        avg_sift = np.mean([np.frombuffer(f['sift'], dtype=np.float32) for f in features_list], axis=0)
+        avg_hog = np.mean([
+            np.frombuffer(features_front['hog'], dtype=np.float64),
+            np.frombuffer(features_left['hog'], dtype=np.float64),
+            np.frombuffer(features_right['hog'], dtype=np.float64)
+        ], axis=0)
 
-        # Convertir de nuevo a bytes
+        avg_lbp = np.mean([
+            np.frombuffer(features_front['lbp'], dtype=np.float32),
+            np.frombuffer(features_left['lbp'], dtype=np.float32),
+            np.frombuffer(features_right['lbp'], dtype=np.float32)
+        ], axis=0)
+
+        avg_sift = np.mean([
+            np.frombuffer(features_front['sift'], dtype=np.float32),
+            np.frombuffer(features_left['sift'], dtype=np.float32),
+            np.frombuffer(features_right['sift'], dtype=np.float32)
+        ], axis=0)
+
         final_features = {
             'hog': avg_hog.tobytes(),
             'lbp': avg_lbp.tobytes(),
@@ -211,7 +225,7 @@ def register_user():
                     data['codigo_unico'],
                     data['email'],
                     bool(data['requisitoriado']),
-                    data['imagen_facial'],
+                    None,
                     final_features['hog'],
                     final_features['lbp'],
                     final_features['sift']
