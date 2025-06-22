@@ -5,16 +5,18 @@ from PIL import Image
 import io
 import base64
 import cv2
-import sqlite3
 import os
 from skimage.feature import hog, local_binary_pattern
 from sklearn.metrics.pairwise import cosine_similarity
 import json
+from scipy.signal import convolve2d
+import psycopg2
+import psycopg2.extras
 
 app = Flask(__name__)
 
 # Configuración
-DATABASE = 'users.db'
+DATABASE_URL = os.getenv('DATABASE_URL')
 HOG_PARAMS = {
     'orientations': 9,
     'pixels_per_cell': (8, 8),
@@ -37,8 +39,8 @@ SIFT_PARAMS = {
 MATCH_THRESHOLD = 0.7  # Umbral de similitud
 
 def get_db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.cursor_factory = psycopg2.extras.RealDictCursor
     return conn
 
 def init_db():
@@ -46,16 +48,17 @@ def init_db():
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 nombre TEXT NOT NULL,
                 apellido TEXT NOT NULL,
                 codigo_unico TEXT UNIQUE NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 requisitoriado BOOLEAN NOT NULL,
                 imagen_facial TEXT,
-                hog_features BLOB,
-                lbp_features BLOB,
-                sift_features BLOB
+                hog_features BYTEA,
+                lbp_features BYTEA,
+                sift_features BYTEA,
+                lpq_features BYTEA
             )
         ''')
         conn.commit()
@@ -90,6 +93,34 @@ def augment_image(image):
     augmented_images.append(noisy)
 
     return augmented_images
+
+def lpq(image, win_size=3):
+    rho = 0.90
+    STFTalpha = 1.0 / win_size
+    conv_mode = 'valid'
+
+    x = np.arange(-win_size // 2 + 1., win_size // 2 + 1.)
+    n = len(x)
+    w0 = np.ones(n)
+    w1 = np.exp(-2 * np.pi * x * STFTalpha * 1j)
+
+    filter_resp = []
+    filter_resp.append(convolve2d(image, np.real(w1[:, np.newaxis] * w0), mode=conv_mode))
+    filter_resp.append(convolve2d(image, np.imag(w1[:, np.newaxis] * w0), mode=conv_mode))
+    filter_resp.append(convolve2d(image, np.real(w0[:, np.newaxis] * w1), mode=conv_mode))
+    filter_resp.append(convolve2d(image, np.imag(w0[:, np.newaxis] * w1), mode=conv_mode))
+
+    freq_resp = np.stack(filter_resp, axis=-1)
+    lpq_desc = ((freq_resp > 0) * (1 << np.arange(freq_resp.shape[-1]))).sum(axis=-1).flatten()
+
+    hist, _ = np.histogram(lpq_desc, bins=256, range=(0, 255))
+    hist = hist.astype(float)
+    hist /= (hist.sum() + 1e-7)
+
+    if np.isnan(hist).any():
+        hist = np.zeros_like(hist)
+
+    return hist
 
 def extract_features(image_array):
     # Redimensionar imagen a tamaño fijo (ejemplo: 128x128)
@@ -130,10 +161,14 @@ def extract_features(image_array):
 
     sift_features = np.mean(sift_descriptors, axis=0) if sift_descriptors is not None and len(sift_descriptors) > 0 else np.zeros(128)
 
+    # LPQ
+    lpq_features = lpq(gray)
+
     return {
         'hog': hog_features.tobytes(),
         'lbp': lbp_hist.tobytes(),
-        'sift': sift_features.tobytes()
+        'sift': sift_features.tobytes(),
+        'lpq': lpq_features.tobytes()
     }
 
 def compare_features(query_features, stored_features):
@@ -146,6 +181,15 @@ def compare_features(query_features, stored_features):
     
     query_sift = np.frombuffer(query_features['sift'], dtype=np.float32)
     stored_sift = np.frombuffer(stored_features['sift'], dtype=np.float32)
+
+    expected_lpq_size = 256  # Adjust this based on your LPQ histogram size
+
+    query_lpq = np.frombuffer(query_features['lpq'], dtype=np.float32)
+    stored_lpq_data = stored_features['lpq']
+    if stored_lpq_data is None:
+        stored_lpq = np.zeros(expected_lpq_size, dtype=np.float32)
+    else:
+        stored_lpq = np.frombuffer(stored_lpq_data, dtype=np.float32)
     
     # Calcular similitudes (1 es perfecto, 0 es nada similar)
     hog_sim = cosine_similarity([query_hog], [stored_hog])[0][0]
@@ -156,12 +200,15 @@ def compare_features(query_features, stored_features):
         sift_sim = 0
     else:
         sift_sim = cosine_similarity([query_sift], [stored_sift])[0][0]
+
+    lpq_sim = cosine_similarity([query_lpq], [stored_lpq])[0][0]
     
     # Ponderación de características (ajustable)
-    weights = {'hog': 0.4, 'lbp': 0.3, 'sift': 0.3}
+    weights = {'hog': 0.3, 'lbp': 0.2, 'sift': 0.3, 'lpq': 0.2}
     total_sim = (hog_sim * weights['hog'] + 
                 lbp_sim * weights['lbp'] + 
-                sift_sim * weights['sift'])
+                sift_sim * weights['sift'] + 
+                lpq_sim * weights['lpq'])
     
     return total_sim
 
@@ -205,10 +252,20 @@ def register_user():
             np.frombuffer(features_right['sift'], dtype=np.float32)
         ], axis=0)
 
+        avg_lpq = np.mean([
+            np.frombuffer(features_front['lpq'], dtype=np.float32),
+            np.frombuffer(features_left['lpq'], dtype=np.float32),
+            np.frombuffer(features_right['lpq'], dtype=np.float32)
+        ], axis=0)
+
+        if np.isnan(avg_lpq).any():
+            avg_lpq = np.zeros_like(avg_lpq)
+
         final_features = {
             'hog': avg_hog.tobytes(),
             'lbp': avg_lbp.tobytes(),
-            'sift': avg_sift.tobytes()
+            'sift': avg_sift.tobytes(),
+            'lpq': avg_lpq.tobytes()
         }
         
         # Guardar en base de datos
@@ -217,8 +274,8 @@ def register_user():
             try:
                 cursor.execute('''
                     INSERT INTO users 
-                    (nombre, apellido, codigo_unico, email, requisitoriado, imagen_facial, hog_features, lbp_features, sift_features)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (nombre, apellido, codigo_unico, email, requisitoriado, imagen_facial, hog_features, lbp_features, sift_features, lpq_features)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''', (
                     data['nombre'],
                     data['apellido'],
@@ -228,10 +285,11 @@ def register_user():
                     None,
                     final_features['hog'],
                     final_features['lbp'],
-                    final_features['sift']
+                    final_features['sift'],
+                    final_features['lpq']
                 ))
                 conn.commit()
-            except sqlite3.IntegrityError as e:
+            except psycopg2.IntegrityError as e:
                 return jsonify({'error': 'El código único o email ya existen'}), 400
             except Exception as e:
                 return jsonify({'error': str(e)}), 400
@@ -260,7 +318,7 @@ def recognize_face():
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT id, nombre, apellido, codigo_unico, email, requisitoriado, 
-                       hog_features, lbp_features, sift_features 
+                       hog_features, lbp_features, sift_features, lpq_features
                 FROM users
             ''')
             users = cursor.fetchall()
@@ -273,7 +331,8 @@ def recognize_face():
             stored_features = {
                 'hog': user['hog_features'],
                 'lbp': user['lbp_features'],
-                'sift': user['sift_features']
+                'sift': user['sift_features'],
+                'lpq': user['lpq_features']
             }
 
             similarity = compare_features(query_features, stored_features)
@@ -303,7 +362,8 @@ def recognize_face():
                 'features_used': {
                     'hog': 'Histogram of Oriented Gradients',
                     'lbp': 'Local Binary Patterns',
-                    'sift': 'Scale-Invariant Feature Transform'
+                    'sift': 'Scale-Invariant Feature Transform',
+                    'lpq': 'Local Phase Quantization'
                 }
             }), 200
         else:
@@ -338,7 +398,7 @@ def delete_user(user_id):
     try:
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
+            cursor.execute('DELETE FROM users WHERE id = %s', (user_id,))
             conn.commit()
             if cursor.rowcount == 0:
                 return jsonify({'error': 'Usuario no encontrado'}), 404
