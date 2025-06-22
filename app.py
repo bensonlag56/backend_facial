@@ -64,6 +64,33 @@ def image_to_array(image_data):
     img = Image.open(io.BytesIO(base64.b64decode(image_data))).convert('RGB')
     return np.array(img)
 
+def augment_image(image):
+    augmented_images = []
+
+    # Original
+    augmented_images.append(image)
+
+    # Flip horizontal
+    flipped = cv2.flip(image, 1)
+    augmented_images.append(flipped)
+
+    # Rotate +10°
+    M = cv2.getRotationMatrix2D((image.shape[1]//2, image.shape[0]//2), 10, 1)
+    rotated = cv2.warpAffine(image, M, (image.shape[1], image.shape[0]))
+    augmented_images.append(rotated)
+
+    # Rotate -10°
+    M = cv2.getRotationMatrix2D((image.shape[1]//2, image.shape[0]//2), -10, 1)
+    rotated = cv2.warpAffine(image, M, (image.shape[1], image.shape[0]))
+    augmented_images.append(rotated)
+
+    # Add Gaussian noise
+    noise = np.random.normal(0, 10, image.shape).astype(np.uint8)
+    noisy = cv2.add(image, noise)
+    augmented_images.append(noisy)
+
+    return augmented_images
+
 def extract_features(image_array):
     # Redimensionar imagen a tamaño fijo (ejemplo: 128x128)
     fixed_size = (128, 128)
@@ -152,8 +179,23 @@ def register_user():
         except:
             return jsonify({'error': 'Imagen inválida'}), 400
         
-        # Extraer características
-        features = extract_features(img_array)
+        # Aplicar aumento de datos
+        augmented_images = augment_image(img_array)
+
+        # Extraer características de todas las imágenes aumentadas
+        features_list = [extract_features(img) for img in augmented_images]
+
+        # Promediar características
+        avg_hog = np.mean([np.frombuffer(f['hog'], dtype=np.float64) for f in features_list], axis=0)
+        avg_lbp = np.mean([np.frombuffer(f['lbp'], dtype=np.float32) for f in features_list], axis=0)
+        avg_sift = np.mean([np.frombuffer(f['sift'], dtype=np.float32) for f in features_list], axis=0)
+
+        # Convertir de nuevo a bytes
+        final_features = {
+            'hog': avg_hog.tobytes(),
+            'lbp': avg_lbp.tobytes(),
+            'sift': avg_sift.tobytes()
+        }
         
         # Guardar en base de datos
         with get_db() as conn:
@@ -170,9 +212,9 @@ def register_user():
                     data['email'],
                     bool(data['requisitoriado']),
                     data['imagen_facial'],
-                    features['hog'],
-                    features['lbp'],
-                    features['sift']
+                    final_features['hog'],
+                    final_features['lbp'],
+                    final_features['sift']
                 ))
                 conn.commit()
             except sqlite3.IntegrityError as e:
