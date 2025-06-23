@@ -122,6 +122,23 @@ def lpq(image, win_size=3):
 
     return hist
 
+# Gabor features extraction
+def gabor_features(image, ksize=31):
+    filters = []
+    for theta in (0, np.pi/4, np.pi/2, 3*np.pi/4):
+        kernel = cv2.getGaborKernel((ksize, ksize), 4.0, theta, 10.0, 0.5, 0, ktype=cv2.CV_32F)
+        filters.append(kernel)
+
+    accum = np.zeros_like(image, dtype=np.float32)
+    for kern in filters:
+        fimg = cv2.filter2D(image, cv2.CV_8UC3, kern)
+        accum = np.maximum(accum, fimg)
+
+    hist, _ = np.histogram(accum, bins=256, range=(0, 255))
+    hist = hist.astype(np.float32)
+    hist /= (hist.sum() + 1e-6)
+    return hist
+
 def extract_features(image_array):
     # Redimensionar imagen a tamaño fijo (ejemplo: 128x128)
     fixed_size = (128, 128)
@@ -164,52 +181,55 @@ def extract_features(image_array):
     # LPQ
     lpq_features = lpq(gray)
 
+    # Gabor
+    gabor_feat = gabor_features(gray)
+
     return {
         'hog': hog_features.tobytes(),
         'lbp': lbp_hist.tobytes(),
         'sift': sift_features.tobytes(),
-        'lpq': lpq_features.tobytes()
+        'lpq': lpq_features.tobytes(),
+        'gabor': gabor_feat.tobytes()
     }
 
 def compare_features(query_features, stored_features):
-    # Convertir bytes a numpy arrays
     query_hog = np.frombuffer(query_features['hog'], dtype=np.float64)
     stored_hog = np.frombuffer(stored_features['hog'], dtype=np.float64)
-    
+
     query_lbp = np.frombuffer(query_features['lbp'], dtype=np.float32)
     stored_lbp = np.frombuffer(stored_features['lbp'], dtype=np.float32)
-    
+
     query_sift = np.frombuffer(query_features['sift'], dtype=np.float32)
     stored_sift = np.frombuffer(stored_features['sift'], dtype=np.float32)
 
-    expected_lpq_size = 256  # Adjust this based on your LPQ histogram size
-
+    expected_lpq_size = 256
     query_lpq = np.frombuffer(query_features['lpq'], dtype=np.float32)
-    stored_lpq_data = stored_features['lpq']
-    if stored_lpq_data is None:
-        stored_lpq = np.zeros(expected_lpq_size, dtype=np.float32)
-    else:
-        stored_lpq = np.frombuffer(stored_lpq_data, dtype=np.float32)
-    
-    # Calcular similitudes (1 es perfecto, 0 es nada similar)
+    stored_lpq = np.frombuffer(stored_features['lpq'], dtype=np.float32) if stored_features['lpq'] else np.zeros(expected_lpq_size, dtype=np.float32)
+
+    # Gabor
+    query_gabor = np.frombuffer(query_features['gabor'], dtype=np.float32)
+    stored_gabor = np.frombuffer(stored_features['gabor'], dtype=np.float32) if stored_features.get('gabor') else np.zeros(256, dtype=np.float32)
+
     hog_sim = cosine_similarity([query_hog], [stored_hog])[0][0]
     lbp_sim = cosine_similarity([query_lbp], [stored_lbp])[0][0]
-    
-    # Manejar caso donde no hay features SIFT
-    if query_sift.size == 0 or stored_sift.size == 0:
-        sift_sim = 0
-    else:
-        sift_sim = cosine_similarity([query_sift], [stored_sift])[0][0]
-
+    sift_sim = cosine_similarity([query_sift], [stored_sift])[0][0] if query_sift.size > 0 and stored_sift.size > 0 else 0
     lpq_sim = cosine_similarity([query_lpq], [stored_lpq])[0][0]
-    
-    # Ponderación de características (ajustable)
-    weights = {'hog': 0.3, 'lbp': 0.2, 'sift': 0.3, 'lpq': 0.2}
-    total_sim = (hog_sim * weights['hog'] + 
-                lbp_sim * weights['lbp'] + 
-                sift_sim * weights['sift'] + 
-                lpq_sim * weights['lpq'])
-    
+    gabor_sim = cosine_similarity([query_gabor], [stored_gabor])[0][0]
+
+    weights = {
+        'hog': 0.25,
+        'lbp': 0.15,
+        'sift': 0.25,
+        'lpq': 0.15,
+        'gabor': 0.2
+    }
+
+    total_sim = (hog_sim * weights['hog'] +
+                 lbp_sim * weights['lbp'] +
+                 sift_sim * weights['sift'] +
+                 lpq_sim * weights['lpq'] +
+                 gabor_sim * weights['gabor'])
+
     return total_sim
 
 @app.route('/register', methods=['POST'])
@@ -258,24 +278,45 @@ def register_user():
             np.frombuffer(features_right['lpq'], dtype=np.float32)
         ], axis=0)
 
+        avg_gabor = np.mean([
+            np.frombuffer(features_front['gabor'], dtype=np.float32),
+            np.frombuffer(features_left['gabor'], dtype=np.float32),
+            np.frombuffer(features_right['gabor'], dtype=np.float32)
+        ], axis=0)
+
         if np.isnan(avg_lpq).any():
             avg_lpq = np.zeros_like(avg_lpq)
+        if np.isnan(avg_gabor).any():
+            avg_gabor = np.zeros_like(avg_gabor)
 
         final_features = {
             'hog': avg_hog.tobytes(),
             'lbp': avg_lbp.tobytes(),
             'sift': avg_sift.tobytes(),
-            'lpq': avg_lpq.tobytes()
+            'lpq': avg_lpq.tobytes(),
+            'gabor': avg_gabor.tobytes()
         }
         
         # Guardar en base de datos
         with get_db() as conn:
             cursor = conn.cursor()
             try:
+                # Add gabor_features column if not exists
+                cursor.execute("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name='users' AND column_name='gabor_features'
+                        ) THEN
+                            ALTER TABLE users ADD COLUMN gabor_features BYTEA;
+                        END IF;
+                    END$$;
+                """)
                 cursor.execute('''
                     INSERT INTO users 
-                    (nombre, apellido, codigo_unico, email, requisitoriado, imagen_facial, hog_features, lbp_features, sift_features, lpq_features)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (nombre, apellido, codigo_unico, email, requisitoriado, imagen_facial, hog_features, lbp_features, sift_features, lpq_features, gabor_features)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ''', (
                     data['nombre'],
                     data['apellido'],
@@ -286,7 +327,8 @@ def register_user():
                     final_features['hog'],
                     final_features['lbp'],
                     final_features['sift'],
-                    final_features['lpq']
+                    final_features['lpq'],
+                    final_features['gabor']
                 ))
                 conn.commit()
             except psycopg2.IntegrityError as e:
@@ -316,9 +358,21 @@ def recognize_face():
 
         with get_db() as conn:
             cursor = conn.cursor()
+            # Add gabor_features column if not exists
+            cursor.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='users' AND column_name='gabor_features'
+                    ) THEN
+                        ALTER TABLE users ADD COLUMN gabor_features BYTEA;
+                    END IF;
+                END$$;
+            """)
             cursor.execute('''
                 SELECT id, nombre, apellido, codigo_unico, email, requisitoriado, 
-                       hog_features, lbp_features, sift_features, lpq_features
+                       hog_features, lbp_features, sift_features, lpq_features, gabor_features
                 FROM users
             ''')
             users = cursor.fetchall()
@@ -332,7 +386,8 @@ def recognize_face():
                 'hog': user['hog_features'],
                 'lbp': user['lbp_features'],
                 'sift': user['sift_features'],
-                'lpq': user['lpq_features']
+                'lpq': user['lpq_features'],
+                'gabor': user.get('gabor_features')
             }
 
             similarity = compare_features(query_features, stored_features)
@@ -363,7 +418,8 @@ def recognize_face():
                     'hog': 'Histogram of Oriented Gradients',
                     'lbp': 'Local Binary Patterns',
                     'sift': 'Scale-Invariant Feature Transform',
-                    'lpq': 'Local Phase Quantization'
+                    'lpq': 'Local Phase Quantization',
+                    'gabor': 'Gabor Filter Histogram'
                 }
             }), 200
         else:
