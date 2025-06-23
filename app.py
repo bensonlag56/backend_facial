@@ -377,18 +377,32 @@ def recognize_face():
 @app.route('/users', methods=['GET'])
 def get_users():
     try:
+        nombre = request.args.get('nombre')
+        apellido = request.args.get('apellido')
+        codigo_unico = request.args.get('codigo_unico')
+
+        query = 'SELECT id, nombre, apellido, codigo_unico, email, requisitoriado FROM users WHERE 1=1'
+        params = []
+
+        if nombre:
+            query += ' AND nombre ILIKE %s'
+            params.append(f'%{nombre}%')
+        if apellido:
+            query += ' AND apellido ILIKE %s'
+            params.append(f'%{apellido}%')
+        if codigo_unico:
+            query += ' AND codigo_unico = %s'
+            params.append(codigo_unico)
+
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                SELECT id, nombre, apellido, codigo_unico, email, requisitoriado 
-                FROM users
-            ''')
+            cursor.execute(query, tuple(params))
             users = cursor.fetchall()
-        
+
         users_list = [dict(user) for user in users]
         for user in users_list:
             user['requisitoriado'] = bool(user['requisitoriado'])
-        
+
         return jsonify(users_list)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -404,6 +418,38 @@ def delete_user(user_id):
                 return jsonify({'error': 'Usuario no encontrado'}), 404
         
         return jsonify({'message': 'Usuario eliminado exitosamente'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/users/<int:user_id>', methods=['PUT'])
+def update_user(user_id):
+    try:
+        data = request.json
+        fields = ['nombre', 'apellido', 'codigo_unico', 'email', 'requisitoriado']
+        updates = []
+        params = []
+
+        for field in fields:
+            if field in data:
+                updates.append(f"{field} = %s")
+                params.append(data[field])
+
+        if not updates:
+            return jsonify({'error': 'No hay campos para actualizar'}), 400
+
+        params.append(user_id)
+
+        query = f"UPDATE users SET {', '.join(updates)} WHERE id = %s"
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, tuple(params))
+            conn.commit()
+
+            if cursor.rowcount == 0:
+                return jsonify({'error': 'Usuario no encontrado'}), 404
+
+        return jsonify({'message': 'Usuario actualizado exitosamente'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
