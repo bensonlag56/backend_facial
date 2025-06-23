@@ -1,0 +1,9 @@
+flask
+opencv-python
+python-dotenv
+psycopg2-binary
+numpy
+Pillow
+scikit-image
+scikit-learn
+scipy
